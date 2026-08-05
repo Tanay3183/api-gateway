@@ -1,0 +1,12 @@
+{
+  "name": "backends",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node cluster.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "api-gateway-project",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "start:backends": "npm run start --workspace=packages/backends",
+    "start:gateway": "npm run start --workspace=packages/gateway",
+    "dev:dashboard": "npm run dev --workspace=packages/admin-dashboard",
+    "dev:client": "npm run dev --workspace=packages/client-app"
+  }
+}
