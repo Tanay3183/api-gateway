@@ -1,3 +1,8 @@
+/**
+ * Backend Cluster Manager
+ * 
+ * Forks multiple child processes to simulate a multi-node backend architecture.
+ */
 import { fork } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';

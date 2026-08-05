@@ -1,3 +1,12 @@
+/**
+ * Core API Gateway & Load Balancer
+ * 
+ * Features:
+ * - Adaptive load balancing using real-time latency and in-flight request scoring.
+ * - Centralized GCRA rate limiting and idempotent POST deduplication via Redis.
+ * - Autonomous circuit breakers with background health ping self-healing.
+ * - WebSockets for real-time cluster telemetry broadcasting.
+ */
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { randomUUID } from 'crypto';
@@ -17,7 +26,7 @@ const backends = [
   { url: 'http://localhost:3003', latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0 }
 ];
 
-// Background Synthetic Health Pings (Circuit Breaker Half-Open State)
+//synthetic Health Pings (Circuit Breaker Half-Open State)
 setInterval(async () => {
   for (const b of backends) {
     if (b.status === 'OPEN' && Date.now() - b.lastFailureTime > 10000) {
@@ -41,16 +50,15 @@ setInterval(async () => {
   }
 }, 5000);
 
-// Add unique correlation ID to every request
 fastify.addHook('onRequest', (req, reply, done) => {
   req.headers['x-correlation-id'] = randomUUID();
   done();
 });
 
-// GCRA Rate Limiting Hook
+//GCRA rate limiting & idempotency hook
 fastify.addHook('preHandler', async (req, reply) => {
-  const burst = 50; // allow bursts of 50 for chaos testing
-  const emissionInterval = 50; // 20 req per sec sustained
+  const burst = 50;
+  const emissionInterval = 50;
   const key = `rate_limit:ip:${req.ip}`;
 
   const [allowed, retryAfter] = await redis.gcraRateLimit(key, burst, emissionInterval, Date.now());
@@ -61,12 +69,11 @@ fastify.addHook('preHandler', async (req, reply) => {
     return reply;
   }
 
-  // Idempotent POST Deduplication
+  //Idempotent POST deduplication (Redis NX lock)
   if (req.method === 'POST') {
     const idempotencyKey = req.headers['x-idempotency-key'];
     if (idempotencyKey) {
       const redisKey = `idempotency:${idempotencyKey}`;
-      // Lock the key for 24 hours. NX means 'set if Not eXists'
       const set = await redis.set(redisKey, 'processed', 'EX', 86400, 'NX');
       if (!set) {
         reply.header('x-idempotent-replayed', 'true');
@@ -77,25 +84,22 @@ fastify.addHook('preHandler', async (req, reply) => {
   }
 });
 
-// Adaptive Load Balancing Proxy
 fastify.route({
   method: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'],
   url: '/*',
   handler: async (req, reply) => {
-    // Circuit Breaker: Filter available backends
     const availableBackends = backends.filter(b => b.status === 'CLOSED' || b.status === 'HALF_OPEN');
     if (availableBackends.length === 0) {
       return reply.status(503).send({ error: 'Service Unavailable', message: 'All backend nodes are currently dead.' });
     }
 
-    // Pick backend with lowest score among available nodes. 
-    // Tie-breaker: totalRequests ensures round-robin on equal latencies
-    const upstream = availableBackends.reduce((best, curr) => { // "reduce" iterates the array(Like Ocaml)
+    //Adaptive scoring
+    const upstream = availableBackends.reduce((best, curr) => {
       const currScore = curr.latency * (curr.requests + 1) + (curr.totalRequests * 0.0001);
       const bestScore = best.latency * (best.requests + 1) + (best.totalRequests * 0.0001);
       return (currScore < bestScore) ? curr : best;
     });
-    
+
     upstream.requests++;
     upstream.totalRequests++;
     const start = Date.now();
@@ -106,25 +110,22 @@ fastify.route({
     try {
       const { statusCode, headers, body } = await request(targetUrl, {
         method: req.method,
-        headers: { ...req.headers, host: undefined }, // Strip host so it uses the upstream's host
+        headers: { ...req.headers, host: undefined },
         body: req.method !== 'GET' && req.method !== 'HEAD' ? req.raw : undefined
       });
 
       reply.status(statusCode);
-
-      // Success, reset circuit breaker failures
       upstream.failures = 0;
-      
+
       for (const [key, value] of Object.entries(headers)) {
         reply.header(key, value);
       }
 
       return reply.send(body);
     } catch (err) {
-      // Circuit Breaker Failure Logging
       fastify.log.error(`Request to ${upstream.url} failed: ${err.message}`);
       upstream.failures++;
-      
+
       if (upstream.failures >= 3 && upstream.status === 'CLOSED') {
         upstream.status = 'OPEN';
         upstream.lastFailureTime = Date.now();
@@ -135,7 +136,6 @@ fastify.route({
     } finally {
       upstream.requests--;
       const duration = Math.max(1, Date.now() - start);
-      // Exponential moving average: 80% old, 20% new
       upstream.latency = (upstream.latency === 0) ? duration : (upstream.latency * 0.8 + duration * 0.2);
     }
   }
@@ -151,9 +151,7 @@ const start = async () => {
   }
 };
 
-// Start the HTTP Server
 start().then(() => {
-  // Initialize WebSocket Server for Real-Time Metrics
   const io = new Server(fastify.server, {
     cors: { origin: '*' }
   });
@@ -162,7 +160,6 @@ start().then(() => {
     fastify.log.info(`Dashboard connected: ${socket.id}`);
   });
 
-  // Broadcast backend metrics every 1 second
   setInterval(() => {
     io.emit('metrics', backends);
   }, 1000);

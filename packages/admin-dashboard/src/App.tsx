@@ -1,3 +1,10 @@
+/**
+ * Resilient Architecture Admin Dashboard
+ * 
+ * A real-time monitoring interface built with React and Tailwind CSS.
+ * Connects to the API Gateway via WebSockets to visualize cluster topology,
+ * in-flight requests, load balancing distributions, and circuit breaker states.
+ */
 import React, { useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
 import { Activity, Server, Zap, AlertTriangle, ShieldCheck } from 'lucide-react';
@@ -32,7 +39,6 @@ export default function App() {
     <div className="min-h-screen bg-background p-8 text-white selection:bg-primary/30 font-sans">
       <div className="max-w-6xl mx-auto space-y-8">
 
-        {/* Header */}
         <header className="flex items-center justify-between">
           <div>
             <h1 className="text-4xl font-bold tracking-tight bg-gradient-to-r from-blue-400 to-primary bg-clip-text text-transparent">
@@ -46,7 +52,6 @@ export default function App() {
           </div>
         </header>
 
-        {/* Cluster Grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {metrics.map((backend) => (
             <div key={backend.url} className="glass-panel p-6 relative overflow-hidden group transition-all hover:-translate-y-1 hover:shadow-2xl hover:shadow-primary/10 hover:border-primary/30">
@@ -65,7 +70,6 @@ export default function App() {
                   <p className="text-xs text-gray-500 font-mono mt-1.5">{backend.url}</p>
                 </div>
 
-                {/* Circuit Breaker Badge */}
                 <div className={`px-3 py-1.5 rounded-full text-xs font-bold border flex items-center gap-1.5 ${backend.status === 'CLOSED' ? 'bg-success/10 text-success border-success/20 shadow-[0_0_15px_rgba(16,185,129,0.1)]' :
                     backend.status === 'HALF_OPEN' ? 'bg-warning/10 text-warning border-warning/20 shadow-[0_0_15px_rgba(245,158,11,0.1)]' :
                       'bg-danger/10 text-danger border-danger/20 shadow-[0_0_15px_rgba(239,68,68,0.1)]'
@@ -77,7 +81,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Metrics */}
               <div className="grid grid-cols-2 gap-4">
                 <div className="bg-surface/50 rounded-xl p-4 border border-white/5 backdrop-blur-sm">
                   <div className="text-gray-400 text-xs font-medium mb-1.5 flex items-center gap-1.5 uppercase tracking-wider">
@@ -105,7 +108,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Failures Warning */}
               {backend.failures > 0 && (
                 <div className="mt-4 text-xs font-medium text-danger flex items-center gap-2 bg-danger/10 px-4 py-3 rounded-xl border border-danger/20">
                   <AlertTriangle className="w-4 h-4" />

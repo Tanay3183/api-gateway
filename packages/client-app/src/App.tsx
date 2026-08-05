@@ -1,3 +1,9 @@
+/**
+ * Client Application Simulator
+ * 
+ * Integrates TanStack Query to gracefully handle 429 backpressure (Retry-After)
+ * and demonstrates idempotent POST requests preventing duplicate transactions.
+ */
 import React, { useState } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import axios, { AxiosError } from 'axios';
@@ -15,7 +21,6 @@ export default function App() {
 
   const addLog = (msg: string) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 10));
 
-  // GET Query
   const { data, refetch, isFetching, failureCount } = useQuery({
     queryKey: ['data'],
     queryFn: async () => {
@@ -24,10 +29,9 @@ export default function App() {
       addLog(`Success! Routed to ${res.data.instance}`);
       return res.data;
     },
-    enabled: false, // Don't fetch automatically on mount
+    enabled: false,
   });
 
-  // POST Mutation
   const checkoutMutation = useMutation({
     mutationFn: async (key: string) => {
       addLog(`Sending POST with Idempotency-Key: ${key.split('-')[0]}...`);
@@ -57,7 +61,6 @@ export default function App() {
     for(let i=0; i<15; i++) {
       apiClient.get('/data').catch(() => {});
     }
-    // Refetch the main query slightly after to show TanStack catching the 429 and waiting
     setTimeout(() => refetch(), 100);
   };
 
@@ -74,7 +77,6 @@ export default function App() {
 
         <div className="grid md:grid-cols-2 gap-8">
           
-          {/* Rate Limiting Demo */}
           <div className="bg-white rounded-3xl p-8 shadow-xl border border-gray-100 transition-all hover:shadow-2xl hover:border-gray-200">
             <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
               <Clock className="text-warning w-7 h-7" /> Rate Limit Handler
@@ -117,7 +119,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Idempotency Demo */}
           <div className="bg-white rounded-3xl p-8 shadow-xl border border-gray-100 transition-all hover:shadow-2xl hover:border-gray-200">
             <h2 className="text-2xl font-bold mb-4 flex items-center gap-2">
               <ShieldAlert className="text-danger w-7 h-7" /> Idempotent POST
@@ -155,7 +156,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Real-time Logs */}
         <div className="bg-gray-900 rounded-3xl p-6 shadow-2xl overflow-hidden mt-8 border border-gray-800">
           <h3 className="text-white font-bold flex items-center gap-2 mb-6">
             <Activity className="w-5 h-5 text-primary" /> Live Network Trace

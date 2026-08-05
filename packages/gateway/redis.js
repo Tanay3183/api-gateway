@@ -1,39 +1,43 @@
+/**
+ * Redis "Shared Brain" Client
+ * 
+ * Manages the singleton connection to Redis and executes Lua scripts
+ * for high-performance, atomic rate limiting (GCRA algorithm).
+ */
 import Redis from 'ioredis';
 
-const redis = new Redis(); // defaults to localhost:6379
+const redis = new Redis();
 
-// GCRA Lua Script
-// KEYS[1]: Rate limit key (e.g., 'rate_limit:ip:127.0.0.1')
-// ARGV[1]: Burst capacity
-// ARGV[2]: Emission interval in milliseconds
-// ARGV[3]: Current time in milliseconds
-const GCRA_LUA = `
-local key = KEYS[1]
-local burst = tonumber(ARGV[1])
-local emission_interval = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
+const gcraScript = `
+  local rate_limit_key = KEYS[1]
+  local burst = tonumber(ARGV[1])
+  local emission_interval = tonumber(ARGV[2])
+  local current_time = tonumber(ARGV[3])
 
-local tat = redis.call('GET', key)
-if not tat then
-  tat = now
-else
-  tat = tonumber(tat)
-end
+  local tat = redis.call('GET', rate_limit_key)
+  if not tat then
+    tat = current_time
+  else
+    tat = tonumber(tat)
+  end
 
-local new_tat = math.max(tat, now) + emission_interval
-local allow_at = new_tat - (burst * emission_interval)
+  tat = math.max(tat, current_time)
 
-if now < allow_at then
-  return { 0, tostring(math.ceil((allow_at - now) / 1000)) } -- Rejected, return Retry-After in seconds
-end
+  local new_tat = tat + emission_interval
+  local allow_at = new_tat - (burst * emission_interval)
 
-redis.call('SET', key, new_tat, 'PX', math.max(new_tat - now, emission_interval))
-return { 1, "0" } -- Allowed
+  if allow_at > current_time then
+    local retry_after = math.ceil((allow_at - current_time) / 1000)
+    return {0, retry_after}
+  end
+
+  redis.call('SET', rate_limit_key, new_tat, 'EX', math.ceil((new_tat - current_time) / 1000) + 1)
+  return {1, 0}
 `;
 
 redis.defineCommand('gcraRateLimit', {
   numberOfKeys: 1,
-  lua: GCRA_LUA,
+  lua: gcraScript,
 });
 
 export default redis;
