@@ -12,9 +12,37 @@ import cors from '@fastify/cors';
 import { randomUUID } from 'crypto';
 import { request } from 'undici';
 import { Server } from 'socket.io';
+import client from 'prom-client';
 import redis from './redis.js';
 
 const fastify = Fastify({ logger: true });
+
+// === Prometheus Metrics Setup ===
+client.collectDefaultMetrics({ prefix: 'gateway_' });
+
+const rateLimitCounter = new client.Counter({
+  name: 'gateway_rate_limits_total',
+  help: 'Total number of requests blocked by GCRA rate limiter'
+});
+rateLimitCounter.inc(0);
+
+const idempotencyCounter = new client.Counter({
+  name: 'gateway_idempotency_rejects_total',
+  help: 'Total number of duplicate POST requests intercepted'
+});
+idempotencyCounter.inc(0);
+
+const requestDurationHistogram = new client.Histogram({
+  name: 'gateway_request_duration_seconds',
+  help: 'Histogram of proxy request latencies in seconds',
+  labelNames: ['method', 'status', 'backend'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
+});
+
+const circuitBreakerGauge = new client.Gauge({
+  name: 'gateway_circuit_breaker_open_total',
+  help: 'Number of backend nodes currently in OPEN state'
+});
 
 await fastify.register(cors, {
   origin: '*'
@@ -64,6 +92,7 @@ fastify.addHook('preHandler', async (req, reply) => {
   const [allowed, retryAfter] = await redis.gcraRateLimit(key, burst, emissionInterval, Date.now());
 
   if (allowed === 0) {
+    rateLimitCounter.inc(); // Track Prometheus Metric
     reply.header('Retry-After', retryAfter);
     reply.status(429).send({ error: 'Too Many Requests' });
     return reply;
@@ -76,12 +105,19 @@ fastify.addHook('preHandler', async (req, reply) => {
       const redisKey = `idempotency:${idempotencyKey}`;
       const set = await redis.set(redisKey, 'processed', 'EX', 86400, 'NX');
       if (!set) {
+        idempotencyCounter.inc(); // Track Prometheus Metric
         reply.header('x-idempotent-replayed', 'true');
         reply.status(409).send({ error: 'Conflict', message: 'Duplicate request ignored' });
         return reply;
       }
     }
   }
+});
+
+// === Prometheus Scrape Endpoint ===
+fastify.get('/metrics', async (req, reply) => {
+  reply.header('Content-Type', client.register.contentType);
+  return await client.register.metrics();
 });
 
 fastify.route({
@@ -103,6 +139,7 @@ fastify.route({
     upstream.requests++;
     upstream.totalRequests++;
     const start = Date.now();
+    const endPrometheusTimer = requestDurationHistogram.startTimer(); // Start metric timer
 
     const targetUrl = upstream.url + req.raw.url;
     fastify.log.info(`Routing to ${targetUrl} (latency: ${upstream.latency.toFixed(2)}ms, in-flight: ${upstream.requests})`);
@@ -121,6 +158,8 @@ fastify.route({
         reply.header(key, value);
       }
 
+      endPrometheusTimer({ method: req.method, status: statusCode, backend: upstream.url }); // Record successful metric
+
       return reply.send(body);
     } catch (err) {
       fastify.log.error(`Request to ${upstream.url} failed: ${err.message}`);
@@ -129,9 +168,11 @@ fastify.route({
       if (upstream.failures >= 3 && upstream.status === 'CLOSED') {
         upstream.status = 'OPEN';
         upstream.lastFailureTime = Date.now();
+        circuitBreakerGauge.inc(); // Track open circuit
         fastify.log.error(`Circuit to ${upstream.url} tripped OPEN after 3 consecutive failures.`);
       }
 
+      endPrometheusTimer({ method: req.method, status: 502, backend: upstream.url }); // Record failed metric
       reply.status(502).send({ error: 'Bad Gateway', backend: upstream.url });
     } finally {
       upstream.requests--;
@@ -151,7 +192,7 @@ const start = async () => {
   }
 };
 
-start().then(() => {
+  start().then(() => {
   const io = new Server(fastify.server, {
     cors: { origin: '*' }
   });
@@ -162,5 +203,9 @@ start().then(() => {
 
   setInterval(() => {
     io.emit('metrics', backends);
+    
+    // Sync circuit breaker gauge
+    const openCircuits = backends.filter(b => b.status === 'OPEN').length;
+    circuitBreakerGauge.set(openCircuits);
   }, 1000);
 });
