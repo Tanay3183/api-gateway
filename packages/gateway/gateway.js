@@ -6,6 +6,10 @@
  * - Centralized GCRA rate limiting and idempotent POST deduplication via Redis.
  * - Autonomous circuit breakers with background health ping self-healing.
  * - WebSockets for real-time cluster telemetry broadcasting.
+ * - Request validation layer to reject malformed/malicious payloads.
+ * - Bull job queue for async processing of POST request bodies.
+ * - Redis-backed response caching for GET requests (60s TTL).
+ * - Winston file logging for structured audit trails.
  */
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -14,6 +18,35 @@ import { request } from 'undici';
 import { Server } from 'socket.io';
 import client from 'prom-client';
 import redis from './redis.js';
+import Queue from 'bull';
+import winston from 'winston';
+import { mkdir } from 'fs/promises';
+
+// === Winston File Logger ===
+await mkdir('logs', { recursive: true });
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'logs/combined.log' }),
+  ],
+});
+
+// === Bull Job Queue (backed by Redis) ===
+const jobQueue = new Queue('gateway-jobs', { redis: { host: '127.0.0.1', port: 6379 } });
+
+jobQueue.process(async (job) => {
+  logger.info('Processing queued job', { jobId: job.id, data: job.data });
+  // Add downstream async processing logic here
+});
+
+jobQueue.on('failed', (job, err) => {
+  logger.error('Job failed', { jobId: job.id, error: err.message });
+});
 
 const fastify = Fastify({ logger: true });
 
@@ -114,6 +147,47 @@ fastify.addHook('preHandler', async (req, reply) => {
   }
 });
 
+// === Request Validation Hook ===
+fastify.addHook('preValidation', (req, reply, done) => {
+  const method = req.method;
+  const url = req.raw.url || '';
+  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+  const userAgent = req.headers['user-agent'] || '';
+
+  // Winston audit log for every incoming request
+  logger.info('Incoming request', {
+    correlationId: req.headers['x-correlation-id'],
+    method,
+    url,
+    ip: req.ip,
+    userAgent,
+  });
+
+  // Reject payloads over 1 MB
+  if (contentLength > 1_048_576) {
+    logger.warn('Request rejected: payload too large', { url, contentLength, ip: req.ip });
+    reply.status(413).send({ error: 'Payload Too Large', maxBytes: 1048576 });
+    return;
+  }
+
+  // Reject obviously malicious URL patterns (path traversal, SQLi probes)
+  const suspiciousPattern = /(\.\.[/\\]|<script|select.+from|union.+select|exec\s*\()/i;
+  if (suspiciousPattern.test(url)) {
+    logger.warn('Request rejected: suspicious URL pattern', { url, ip: req.ip });
+    reply.status(400).send({ error: 'Bad Request', message: 'Invalid request path' });
+    return;
+  }
+
+  // Reject requests missing a User-Agent (bot/scanner heuristic)
+  if (!userAgent.trim()) {
+    logger.warn('Request rejected: missing User-Agent', { url, ip: req.ip });
+    reply.status(400).send({ error: 'Bad Request', message: 'User-Agent header is required' });
+    return;
+  }
+
+  done();
+});
+
 // === Prometheus Scrape Endpoint ===
 fastify.get('/metrics', async (req, reply) => {
   reply.header('Content-Type', client.register.contentType);
@@ -144,6 +218,25 @@ fastify.route({
     const targetUrl = upstream.url + req.raw.url;
     fastify.log.info(`Routing to ${targetUrl} (latency: ${upstream.latency.toFixed(2)}ms, in-flight: ${upstream.requests})`);
 
+    // === Response Cache: serve from Redis for GET requests ===
+    if (req.method === 'GET') {
+      const cacheKey = `cache:${req.raw.url}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        upstream.requests--;
+        endPrometheusTimer({ method: req.method, status: 200, backend: 'cache' });
+        logger.info('Cache hit', { url: req.raw.url });
+        reply.header('x-cache', 'HIT');
+        return reply.status(200).send(cached);
+      }
+    }
+
+    // === Job Queue: enqueue POST body for async processing ===
+    if (req.method === 'POST' && req.body) {
+      await jobQueue.add({ url: req.raw.url, body: req.body, correlationId: req.headers['x-correlation-id'] });
+      logger.info('Job enqueued', { url: req.raw.url, correlationId: req.headers['x-correlation-id'] });
+    }
+
     try {
       const { statusCode, headers, body } = await request(targetUrl, {
         method: req.method,
@@ -160,9 +253,18 @@ fastify.route({
 
       endPrometheusTimer({ method: req.method, status: statusCode, backend: upstream.url }); // Record successful metric
 
+      // === Response Cache: store successful GET responses (60s TTL) ===
+      if (req.method === 'GET' && statusCode === 200) {
+        const responseText = await body.text();
+        await redis.set(`cache:${req.raw.url}`, responseText, 'EX', 60);
+        reply.header('x-cache', 'MISS');
+        return reply.send(responseText);
+      }
+
       return reply.send(body);
     } catch (err) {
       fastify.log.error(`Request to ${upstream.url} failed: ${err.message}`);
+      logger.error('Upstream proxy error', { upstream: upstream.url, error: err.message, url: req.raw.url });
       upstream.failures++;
 
       if (upstream.failures >= 3 && upstream.status === 'CLOSED') {
