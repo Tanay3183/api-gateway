@@ -10,10 +10,16 @@
  * - Bull job queue for async processing of POST request bodies.
  * - Redis-backed response caching for GET requests (60s TTL).
  * - Winston file logging for structured audit trails.
+ * - Distributed Tracing (W3C Trace Context) injection.
+ * - Dynamic Service Discovery & Canary Splitting (Admin APIs).
+ * - Optional API Key Auth Layer.
+ * - Request/Response Header Transformation (stripping x-powered-by).
+ * - Timeout & Retry with Exponential Backoff for safe methods.
+ * - Graceful Degradation (Stale Cache Fallback on total failure).
  */
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
 import { request } from 'undici';
 import { Server } from 'socket.io';
 import client from 'prom-client';
@@ -21,6 +27,13 @@ import redis from './redis.js';
 import Queue from 'bull';
 import winston from 'winston';
 import { mkdir } from 'fs/promises';
+
+// === Distributed Tracing Helper ===
+function generateTraceparent() {
+  const traceId = randomBytes(16).toString('hex');
+  const spanId = randomBytes(8).toString('hex');
+  return `00-${traceId}-${spanId}-01`;
+}
 
 // === Winston File Logger ===
 await mkdir('logs', { recursive: true });
@@ -41,7 +54,7 @@ const jobQueue = new Queue('gateway-jobs', { redis: { host: '127.0.0.1', port: 6
 
 jobQueue.process(async (job) => {
   logger.info('Processing queued job', { jobId: job.id, data: job.data });
-  // Add downstream async processing logic here
+  // Downstream async processing
 });
 
 jobQueue.on('failed', (job, err) => {
@@ -53,233 +66,226 @@ const fastify = Fastify({ logger: true });
 // === Prometheus Metrics Setup ===
 client.collectDefaultMetrics({ prefix: 'gateway_' });
 
-const rateLimitCounter = new client.Counter({
-  name: 'gateway_rate_limits_total',
-  help: 'Total number of requests blocked by GCRA rate limiter'
-});
-rateLimitCounter.inc(0);
-
-const idempotencyCounter = new client.Counter({
-  name: 'gateway_idempotency_rejects_total',
-  help: 'Total number of duplicate POST requests intercepted'
-});
-idempotencyCounter.inc(0);
-
+const rateLimitCounter = new client.Counter({ name: 'gateway_rate_limits_total', help: 'Blocked requests' });
+const idempotencyCounter = new client.Counter({ name: 'gateway_idempotency_rejects_total', help: 'Duplicate POSTs intercepted' });
 const requestDurationHistogram = new client.Histogram({
-  name: 'gateway_request_duration_seconds',
-  help: 'Histogram of proxy request latencies in seconds',
-  labelNames: ['method', 'status', 'backend'],
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
+  name: 'gateway_request_duration_seconds', help: 'Latencies', labelNames: ['method', 'status', 'backend'], buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
 });
+const circuitBreakerGauge = new client.Gauge({ name: 'gateway_circuit_breaker_open_total', help: 'OPEN state nodes' });
 
-const circuitBreakerGauge = new client.Gauge({
-  name: 'gateway_circuit_breaker_open_total',
-  help: 'Number of backend nodes currently in OPEN state'
-});
+await fastify.register(cors, { origin: '*' });
 
-await fastify.register(cors, {
-  origin: '*'
-});
-
-const backends = [
-  { url: 'http://localhost:3001', latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0 },
-  { url: 'http://localhost:3002', latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0 },
-  { url: 'http://localhost:3003', latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0 }
+// === Dynamic Upstream Service Discovery & Canary ===
+let backends = [
+  { url: 'http://localhost:3001', latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0, weight: 100 },
+  { url: 'http://localhost:3002', latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0, weight: 100 },
+  { url: 'http://localhost:3003', latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0, weight: 100 }
 ];
 
-//synthetic Health Pings (Circuit Breaker Half-Open State)
+// Admin API to register/deregister dynamic backends
+fastify.post('/admin/backends', async (req, reply) => {
+  if (req.headers['x-admin-key'] !== 'supersecret-admin-key') return reply.status(401).send({ error: 'Unauthorized' });
+  const { url, weight = 100 } = req.body;
+  if (!backends.find(b => b.url === url)) {
+    backends.push({ url, latency: 0, requests: 0, totalRequests: 0, status: 'CLOSED', failures: 0, lastFailureTime: 0, weight });
+  }
+  return { success: true, backends };
+});
+
+fastify.delete('/admin/backends', async (req, reply) => {
+  if (req.headers['x-admin-key'] !== 'supersecret-admin-key') return reply.status(401).send({ error: 'Unauthorized' });
+  const { url } = req.body;
+  backends = backends.filter(b => b.url !== url);
+  return { success: true, backends };
+});
+
+// synthetic Health Pings
 setInterval(async () => {
   for (const b of backends) {
     if (b.status === 'OPEN' && Date.now() - b.lastFailureTime > 10000) {
       b.status = 'HALF_OPEN';
-      fastify.log.warn(`Circuit to ${b.url} is HALF_OPEN. Pinging /health...`);
       try {
         const res = await fetch(`${b.url}/health`);
-        if (res.ok) {
-          b.status = 'CLOSED';
-          b.failures = 0;
-          fastify.log.info(`Circuit to ${b.url} CLOSED. Health restored.`);
-        } else {
-          throw new Error('Health ping rejected');
-        }
+        if (res.ok) { b.status = 'CLOSED'; b.failures = 0; }
+        else throw new Error('Health ping rejected');
       } catch (err) {
-        b.status = 'OPEN';
-        b.lastFailureTime = Date.now();
-        fastify.log.warn(`Circuit to ${b.url} remains OPEN. Ping failed.`);
+        b.status = 'OPEN'; b.lastFailureTime = Date.now();
       }
     }
   }
 }, 5000);
 
+// === Request Tracing & Correlation ===
 fastify.addHook('onRequest', (req, reply, done) => {
   req.headers['x-correlation-id'] = randomUUID();
+  req.headers['traceparent'] = req.headers['traceparent'] || generateTraceparent();
   done();
 });
 
-//GCRA rate limiting & idempotency hook
+// === Auth & Rate Limiting ===
 fastify.addHook('preHandler', async (req, reply) => {
-  const burst = 50;
-  const emissionInterval = 50;
-  const key = `rate_limit:ip:${req.ip}`;
-
-  const [allowed, retryAfter] = await redis.gcraRateLimit(key, burst, emissionInterval, Date.now());
-
-  if (allowed === 0) {
-    rateLimitCounter.inc(); // Track Prometheus Metric
-    reply.header('Retry-After', retryAfter);
-    reply.status(429).send({ error: 'Too Many Requests' });
-    return reply;
+  // Auth Layer: If x-api-key is present, validate it. (Optional for load-tests)
+  if (req.headers['x-api-key'] && req.headers['x-api-key'] !== 'valid-dev-key') {
+    return reply.status(401).send({ error: 'Unauthorized', message: 'Invalid API Key' });
   }
 
-  //Idempotent POST deduplication (Redis NX lock)
+  // GCRA rate limiting
+  const [allowed, retryAfter] = await redis.gcraRateLimit(`rate_limit:ip:${req.ip}`, 50, 50, Date.now());
+  if (allowed === 0) {
+    rateLimitCounter.inc();
+    reply.header('Retry-After', retryAfter);
+    return reply.status(429).send({ error: 'Too Many Requests' });
+  }
+
+  // Idempotent POST
   if (req.method === 'POST') {
     const idempotencyKey = req.headers['x-idempotency-key'];
     if (idempotencyKey) {
-      const redisKey = `idempotency:${idempotencyKey}`;
-      const set = await redis.set(redisKey, 'processed', 'EX', 86400, 'NX');
+      const set = await redis.set(`idempotency:${idempotencyKey}`, 'processed', 'EX', 86400, 'NX');
       if (!set) {
-        idempotencyCounter.inc(); // Track Prometheus Metric
+        idempotencyCounter.inc();
         reply.header('x-idempotent-replayed', 'true');
-        reply.status(409).send({ error: 'Conflict', message: 'Duplicate request ignored' });
-        return reply;
+        return reply.status(409).send({ error: 'Conflict' });
       }
     }
   }
 });
 
-// === Request Validation Hook ===
+// === Request Validation ===
 fastify.addHook('preValidation', (req, reply, done) => {
-  const method = req.method;
-  const url = req.raw.url || '';
+  if (req.url.startsWith('/admin')) return done(); // Skip validation for admin endpoints
+
   const contentLength = parseInt(req.headers['content-length'] || '0', 10);
   const userAgent = req.headers['user-agent'] || '';
 
-  // Winston audit log for every incoming request
-  logger.info('Incoming request', {
-    correlationId: req.headers['x-correlation-id'],
-    method,
-    url,
-    ip: req.ip,
-    userAgent,
-  });
+  logger.info('Incoming request', { correlationId: req.headers['x-correlation-id'], method: req.method, url: req.url, ip: req.ip, userAgent });
 
-  // Reject payloads over 1 MB
   if (contentLength > 1_048_576) {
-    logger.warn('Request rejected: payload too large', { url, contentLength, ip: req.ip });
-    reply.status(413).send({ error: 'Payload Too Large', maxBytes: 1048576 });
-    return;
+    logger.warn('Payload too large', { url: req.url, ip: req.ip });
+    return reply.status(413).send({ error: 'Payload Too Large' });
   }
 
-  // Reject obviously malicious URL patterns (path traversal, SQLi probes)
-  const suspiciousPattern = /(\.\.[/\\]|<script|select.+from|union.+select|exec\s*\()/i;
-  if (suspiciousPattern.test(url)) {
-    logger.warn('Request rejected: suspicious URL pattern', { url, ip: req.ip });
-    reply.status(400).send({ error: 'Bad Request', message: 'Invalid request path' });
-    return;
-  }
-
-  // Reject requests missing a User-Agent (bot/scanner heuristic)
-  if (!userAgent.trim()) {
-    logger.warn('Request rejected: missing User-Agent', { url, ip: req.ip });
-    reply.status(400).send({ error: 'Bad Request', message: 'User-Agent header is required' });
-    return;
+  if (/(\.\.[/\\]|<script|select.+from|union.+select|exec\s*\()/i.test(req.url)) {
+    return reply.status(400).send({ error: 'Bad Request', message: 'Invalid path' });
   }
 
   done();
 });
 
-// === Prometheus Scrape Endpoint ===
 fastify.get('/metrics', async (req, reply) => {
   reply.header('Content-Type', client.register.contentType);
   return await client.register.metrics();
 });
 
+// === Core Proxy Route (Timeout, Retry, Fallback, Caching) ===
 fastify.route({
   method: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'],
   url: '/*',
   handler: async (req, reply) => {
-    const availableBackends = backends.filter(b => b.status === 'CLOSED' || b.status === 'HALF_OPEN');
-    if (availableBackends.length === 0) {
-      return reply.status(503).send({ error: 'Service Unavailable', message: 'All backend nodes are currently dead.' });
-    }
-
-    //Adaptive scoring
-    const upstream = availableBackends.reduce((best, curr) => {
-      const currScore = curr.latency * (curr.requests + 1) + (curr.totalRequests * 0.0001);
-      const bestScore = best.latency * (best.requests + 1) + (best.totalRequests * 0.0001);
-      return (currScore < bestScore) ? curr : best;
-    });
-
-    upstream.requests++;
-    upstream.totalRequests++;
-    const start = Date.now();
-    const endPrometheusTimer = requestDurationHistogram.startTimer(); // Start metric timer
-
-    const targetUrl = upstream.url + req.raw.url;
-    fastify.log.info(`Routing to ${targetUrl} (latency: ${upstream.latency.toFixed(2)}ms, in-flight: ${upstream.requests})`);
-
-    // === Response Cache: serve from Redis for GET requests ===
+    // 1. Check Cache for GET requests before picking upstream
     if (req.method === 'GET') {
-      const cacheKey = `cache:${req.raw.url}`;
-      const cached = await redis.get(cacheKey);
+      const cached = await redis.get(`cache:${req.raw.url}`);
       if (cached) {
-        upstream.requests--;
-        endPrometheusTimer({ method: req.method, status: 200, backend: 'cache' });
         logger.info('Cache hit', { url: req.raw.url });
         reply.header('x-cache', 'HIT');
         return reply.status(200).send(cached);
       }
     }
 
-    // === Job Queue: enqueue POST body for async processing ===
+    // 2. Enqueue POSTs
     if (req.method === 'POST' && req.body) {
       await jobQueue.add({ url: req.raw.url, body: req.body, correlationId: req.headers['x-correlation-id'] });
-      logger.info('Job enqueued', { url: req.raw.url, correlationId: req.headers['x-correlation-id'] });
     }
 
-    try {
-      const { statusCode, headers, body } = await request(targetUrl, {
-        method: req.method,
-        headers: { ...req.headers, host: undefined },
-        body: req.method !== 'GET' && req.method !== 'HEAD' ? req.raw : undefined
+    // 3. Retry loop for idempotency (GET/HEAD)
+    const maxRetries = (req.method === 'GET' || req.method === 'HEAD') ? 2 : 0;
+    let attempt = 0;
+
+    while (attempt <= maxRetries) {
+      const availableBackends = backends.filter(b => b.status === 'CLOSED' || b.status === 'HALF_OPEN');
+      
+      // === Graceful Degradation ===
+      if (availableBackends.length === 0) {
+        const staleCache = await redis.get(`cache:${req.raw.url}`);
+        if (staleCache && req.method === 'GET') {
+          reply.header('x-cache', 'STALE');
+          return reply.status(200).send(staleCache);
+        }
+        return reply.status(503).send({ error: 'Service Unavailable' });
+      }
+
+      // Adaptive Canary Load Balancing
+      const upstream = availableBackends.reduce((best, curr) => {
+        const currScore = (curr.latency * (curr.requests + 1) + (curr.totalRequests * 0.0001)) / (curr.weight || 1);
+        const bestScore = (best.latency * (best.requests + 1) + (best.totalRequests * 0.0001)) / (best.weight || 1);
+        return (currScore < bestScore) ? curr : best;
       });
 
-      reply.status(statusCode);
-      upstream.failures = 0;
+      upstream.requests++;
+      upstream.totalRequests++;
+      const start = Date.now();
+      const endPrometheusTimer = requestDurationHistogram.startTimer();
+      const targetUrl = upstream.url + req.raw.url;
 
-      for (const [key, value] of Object.entries(headers)) {
-        reply.header(key, value);
+      try {
+        const { statusCode, headers, body } = await request(targetUrl, {
+          method: req.method,
+          // === Header Transformation & Injection ===
+          headers: { 
+            ...req.headers, 
+            host: undefined,
+            'x-forwarded-for': req.ip,
+            'x-gateway-processed': 'true'
+          },
+          body: req.method !== 'GET' && req.method !== 'HEAD' ? req.raw : undefined,
+          bodyTimeout: 5000,
+          headersTimeout: 5000, // Timeout protection
+        });
+
+        upstream.failures = 0;
+        reply.status(statusCode);
+
+        // Strip internal headers
+        delete headers['x-powered-by'];
+        delete headers['server'];
+
+        for (const [key, value] of Object.entries(headers)) {
+          reply.header(key, value);
+        }
+
+        endPrometheusTimer({ method: req.method, status: statusCode, backend: upstream.url });
+
+        if (req.method === 'GET' && statusCode === 200) {
+          const responseText = await body.text();
+          await redis.set(`cache:${req.raw.url}`, responseText, 'EX', 60);
+          reply.header('x-cache', 'MISS');
+          return reply.send(responseText);
+        }
+
+        return reply.send(body);
+
+      } catch (err) {
+        upstream.failures++;
+        logger.error('Upstream error', { upstream: upstream.url, error: err.message, attempt });
+        
+        if (upstream.failures >= 3 && upstream.status === 'CLOSED') {
+          upstream.status = 'OPEN';
+          upstream.lastFailureTime = Date.now();
+          circuitBreakerGauge.inc();
+        }
+        endPrometheusTimer({ method: req.method, status: 502, backend: upstream.url });
+
+        attempt++;
+        if (attempt > maxRetries) {
+          return reply.status(502).send({ error: 'Bad Gateway', backend: upstream.url });
+        }
+        // Wait backoff before retry (Exponential)
+        await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 100));
+
+      } finally {
+        upstream.requests--;
+        upstream.latency = (upstream.latency === 0) ? Date.now() - start : (upstream.latency * 0.8 + (Date.now() - start) * 0.2);
       }
-
-      endPrometheusTimer({ method: req.method, status: statusCode, backend: upstream.url }); // Record successful metric
-
-      // === Response Cache: store successful GET responses (60s TTL) ===
-      if (req.method === 'GET' && statusCode === 200) {
-        const responseText = await body.text();
-        await redis.set(`cache:${req.raw.url}`, responseText, 'EX', 60);
-        reply.header('x-cache', 'MISS');
-        return reply.send(responseText);
-      }
-
-      return reply.send(body);
-    } catch (err) {
-      fastify.log.error(`Request to ${upstream.url} failed: ${err.message}`);
-      logger.error('Upstream proxy error', { upstream: upstream.url, error: err.message, url: req.raw.url });
-      upstream.failures++;
-
-      if (upstream.failures >= 3 && upstream.status === 'CLOSED') {
-        upstream.status = 'OPEN';
-        upstream.lastFailureTime = Date.now();
-        circuitBreakerGauge.inc(); // Track open circuit
-        fastify.log.error(`Circuit to ${upstream.url} tripped OPEN after 3 consecutive failures.`);
-      }
-
-      endPrometheusTimer({ method: req.method, status: 502, backend: upstream.url }); // Record failed metric
-      reply.status(502).send({ error: 'Bad Gateway', backend: upstream.url });
-    } finally {
-      upstream.requests--;
-      const duration = Math.max(1, Date.now() - start);
-      upstream.latency = (upstream.latency === 0) ? duration : (upstream.latency * 0.8 + duration * 0.2);
     }
   }
 });
@@ -294,20 +300,11 @@ const start = async () => {
   }
 };
 
-  start().then(() => {
-  const io = new Server(fastify.server, {
-    cors: { origin: '*' }
-  });
-
-  io.on('connection', (socket) => {
-    fastify.log.info(`Dashboard connected: ${socket.id}`);
-  });
-
+start().then(() => {
+  const io = new Server(fastify.server, { cors: { origin: '*' } });
+  io.on('connection', (socket) => { fastify.log.info(`Dashboard connected: ${socket.id}`); });
   setInterval(() => {
     io.emit('metrics', backends);
-    
-    // Sync circuit breaker gauge
-    const openCircuits = backends.filter(b => b.status === 'OPEN').length;
-    circuitBreakerGauge.set(openCircuits);
+    circuitBreakerGauge.set(backends.filter(b => b.status === 'OPEN').length);
   }, 1000);
 });
